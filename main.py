@@ -2,6 +2,7 @@ import os
 import logging
 import threading
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 import uvicorn
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command
@@ -119,7 +120,7 @@ dp.include_router(router)
 # --- FASTAPI ДЕШБОРД ---
 app = FastAPI()
 
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
 def read_root():
     db = SessionLocal()
     transactions = db.query(Transaction).order_by(Transaction.date.desc()).limit(20).all()
@@ -142,37 +143,3 @@ def read_root():
         <body>
             <div class="container">
                 <h2>📊 Финансовый дашборд</h2>
-                <p>Последние транзакции:</p>
-                <table>
-                    <tr><th>Дата</th><th>Тип</th><th>Сумма</th><th>Комментарий</th></tr>
-    """
-    for tx in transactions:
-        color = "green" if tx.amount > 0 else "red"
-        date_str = tx.date.strftime('%Y-%m-%d %H:%M') if tx.date else ""
-        html += f"<tr><td>{date_str}</td><td>{tx.type}</td><td style='color:{color};'>{tx.amount}</td><td>{tx.comment}</td></tr>"
-    
-    html += """
-                </table>
-            </div>
-        </body>
-    </html>
-    """
-    return html
-
-async def run_bot():
-    init_db()
-    await dp.start_polling(bot)
-
-def run_web():
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    init_db()
-    
-    web_thread = threading.Thread(target=run_web, daemon=True)
-    web_thread.start()
-    
-    asyncio_run = __import__("asyncio")
-    asyncio_run.run(run_bot())
