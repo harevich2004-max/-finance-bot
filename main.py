@@ -1,183 +1,170 @@
-import asyncio
-import logging
 import os
-from datetime import datetime
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import Command
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
-import uvicorn
+import logging
 import threading
+from fastapi import FastAPI
+import uvicorn
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.filters import Command
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
+from sqlalchemy.orm import declarative_base, sessionmaker
+from datetime import datetime
 
-TOKEN = os.getenv("BOT_TOKEN")
-if not TOKEN:
-    raise ValueError("Не задан BOT_TOKEN в переменных окружения!")
+# --- НАСТРОЙКИ БАЗЫ ДАННЫХ И БОТА ---
+# Токен бота и ссылка на БД берутся из переменных окружения на Render
+TOKEN = os.environ.get("BOT_TOKEN")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
-from database import SessionLocal, Transaction, Category, Debt, init_db
-
+# Инициализация бота и маршрутизатора
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
+router = Router()
 
-# --- TELEGRAM БОТ ЛОГИКА ---
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
+# Настройка SQLAlchemy для Supabase (пул соединений)
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# Модель транзакции в базе данных
+class Transaction(Base):
+    __tablename__ = "transactions"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True)
+    type = Column(String)  # 'income', 'expense', 'debt'
+    amount = Column(Float)
+    description = Column(String)
+    date = Column(DateTime, default=datetime.utcnow)
+
+def init_db():
+    Base.metadata.create_all(bind=engine)
+
+# --- ИНТЕРАКТИВНЫЕ КНОПКИ ---
+def get_main_keyboard():
+    # Твоя постоянная ссылка на дашборд в Render
+    dashboard_url = "https://finance-bot-qshy.onrender.com"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="➕ Доход", callback_data="add_income"),
+            InlineKeyboardButton(text="➖ Расход", callback_data="add_expense")
+        ],
+        [
+            InlineKeyboardButton(text="👥 Долги (Мне / Я должен)", callback_data="manage_debts")
+        ],
+        [
+            InlineKeyboardButton(text="📊 Открыть дашборд", url=dashboard_url)
+        ]
+    ])
+
+# Команда /start
+@router.message(Command("start"))
+async def cmd_start(message: Message):
     await message.answer(
-        "👋 **Привет! Твой облачный фин-бот запущен.**\n\n"
-        "🔹 **Учет трат/доходов:** `-350 Кафе` или `+15000 Зарплата`\n"
-        "🔹 **Долги:** пиши `/debts` или добавляй: `долг Иван 500 за обед`\n"
-        "🔹 **Дашборд:** открывай веб-панель по ссылке твоего сервера."
+        "👋 Привет! Я твой финансовый бот.\n"
+        "Выбери нужное действие с помощью кнопок ниже:",
+        reply_markup=get_main_keyboard()
     )
 
-@dp.message(Command("debts"))
-async def cmd_debts(message: types.Message):
-    db = SessionLocal()
-    debts = db.query(Debt).all()
-    db.close()
-    
-    if not debts:
-        await message.answer("📌 Долгов пока нет.\nДобавить: `долг [Имя] [Сумма] [описание]` (минус — если должен ты).")
-        return
-        
-    text = "📌 **Твои долги:**\n\n"
-    for d in debts:
-        status = "должен тебе" if d.amount > 0 else "ты должен"
-        text += f"• **{d.person}**: {abs(d.amount)} грн ({status}) — *{d.description or ''}*\n"
-    
-    await message.answer(text, parse_mode="Markdown")
+# Обработчики нажатий на кнопки меню
+@router.callback_query(F.data == "add_income")
+async def cb_add_income(callback: CallbackQuery):
+    await callback.message.answer(
+        "📥 **Добавление дохода**\n"
+        "Отправь сумму и описание сообщением, например:\n"
+        "`+5000 Зарплата`"
+    )
+    await callback.answer()
 
-@dp.message(F.text.regexp(r"^долг\s+(?P<person>\S+)\s+(?P<amount>[+\-]?\d+(?:\.\d+)?)(?:\s+(?P<desc>.+))?"))
-async def add_debt_handler(message: types.Message):
-    parts = message.text.split(maxsplit=3)
-    if len(parts) < 3:
-        await message.reply("Формат: `долг Иван 500 за обед`")
-        return
-    
-    person = parts[1]
-    amount = float(parts[2])
-    desc = parts[3] if len(parts) > 3 else ""
-    
-    db = SessionLocal()
-    debt = Debt(person=person, amount=amount, description=desc)
-    db.add(debt)
-    db.commit()
-    db.close()
-    
-    await message.reply(f"✅ Долг сохранен: **{person}** на сумму **{amount} грн**.", parse_mode="Markdown")
+@router.callback_query(F.data == "add_expense")
+async def cb_add_expense(callback: CallbackQuery):
+    await callback.message.answer(
+        "📤 **Добавление расхода**\n"
+        "Отправь сумму и описание сообщением, например:\n"
+        "`-350 Обед`"
+    )
+    await callback.answer()
 
-@dp.message(F.text.regexp(r"^([+\-]?\d+(?:\.\d+)?)\s+(.+)"))
-async def process_transaction(message: types.Message):
+@router.callback_query(F.data == "manage_debts")
+async def cb_manage_debts(callback: CallbackQuery):
+    await callback.message.answer(
+        "👥 **Учет долгов**\n"
+        "Напиши запись в формате:\n"
+        "• `долг мне Имя Сумма` (например: *долг мне Саша 500*)\n"
+        "• `я должен Имя Сумма` (например: *я должен Макс 200*)"
+    )
+    await callback.answer()
+
+# --- ОБРАБОТКА ТЕКСТОВЫХ ЗАПИСЕЙ (ДОХОДЫ / РАСХОДЫ) ---
+@router.message(F.text.regexp(r"^([+-]?\d+(?:\.\d+)?)\s+(.+)"))
+async def process_transaction(message: Message):
     text = message.text.strip()
-    parts = text.split(maxsplit=1)
-    amount = float(parts[0])
-    cat_name = parts[1].strip()
-    
-    t_type = "income" if amount > 0 else "expense"
-    
-    db = SessionLocal()
-    category = db.query(Category).filter(Category.name == cat_name).first()
-    if not category:
-        category = Category(name=cat_name, type=t_type)
-        db.add(category)
-        db.commit()
-        db.refresh(category)
+    try:
+        parts = text.split(maxsplit=1)
+        amount = float(parts[0])
+        description = parts[1]
         
-    tx = Transaction(amount=abs(amount), type=t_type, category_id=category.id, comment=cat_name)
-    db.add(tx)
-    db.commit()
-    db.close()
-    
-    await message.reply(f"✅ Записано: **{amount} грн**\n📂 Категория: *{cat_name}*", parse_mode="Markdown")
+        t_type = "income" if amount > 0 else "expense"
+        
+        db = SessionLocal()
+        new_tx = Transaction(
+            user_id=message.from_user.id,
+            type=t_type,
+            amount=amount,
+            description=description
+        )
+        db.add(new_tx)
+        db.commit()
+        db.close()
+        
+        sign = "+" if amount > 0 else ""
+        await message.answer(f"✅ Успешно записано: <b>{sign}{amount}</b> ({description})")
+    except Exception as e:
+        await message.answer("⚠️ Ошибка при сохранении. Проверь формат записи.")
 
-# --- ВЕБ-ДАШБОРД (FastAPI) ---
+dp.include_router(router)
+
+# --- FASTAPI ДЕШБОРД ---
 app = FastAPI()
 
-@app.get("/", response_class=HTMLResponse)
-async def dashboard():
+@app.get("/")
+def read_root():
     db = SessionLocal()
-    total_expenses = db.query(Transaction).filter(Transaction.type == 'expense').all()
-    total_income = db.query(Transaction).filter(Transaction.type == 'income').all()
-    debts = db.query(Debt).all()
-    recent_txs = db.query(Transaction).order_by(Transaction.id.desc()).limit(15).all()
+    transactions = db.query(Transaction).order_by(Transaction.date.desc()).limit(20).all()
     db.close()
     
-    sum_exp = sum(t.amount for t in total_expenses)
-    sum_inc = sum(t.amount for t in total_income)
+    html = """
+    <html>
+        <head>
+            <title>Finance Dashboard</title>
+            <meta charset="utf-8">
+            <style>
+                body { font-family: Arial, sans-serif; background: #f4f7f6; margin: 0; padding: 20px; }
+                .container { max-width: 800px; margin: auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+                h2 { color: #333; }
+                table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+                th, td { padding: 12px; border-bottom: 1px solid #ddd; text-align: left; }
+                th { background-color: #4CAF50; color: white; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h2>📊 Финансовый дашборд</h2>
+                <p>Последние транзакции из твоего бота:</p>
+                <table>
+                    <tr><th>Дата</th><th>Тип</th><th>Сумма</th><th>Описание</th></tr>
+    """
+    for tx in transactions:
+        color = "green" if tx.amount > 0 else "red"
+        html += f"<tr><td>{tx.date.strftime('%Y-%m-%d %H:%M')}</td><td>{tx.type}</td><td style='color:{color};'>{tx.amount}</td><td>{tx.description}</td></tr>"
     
-    html = f"""
-    <!DOCTYPE html>
-    <html lang="uk">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Финансовый Дашборд</title>
-        <script src="https://cdn.tailwindcss.com"></script>
-    </head>
-    <body class="bg-slate-950 text-slate-100 p-6 font-sans">
-        <div class="max-w-3xl mx-auto">
-            <h1 class="text-3xl font-bold mb-6 flex items-center gap-2">📊 Учет финансов</h1>
-            
-            <div class="grid grid-cols-2 gap-4 mb-8">
-                <div class="bg-slate-900 border border-slate-800 p-5 rounded-2xl shadow-lg">
-                    <p class="text-slate-400 text-sm">Доходы</p>
-                    <p class="text-3xl font-bold text-emerald-400 mt-1">+{sum_inc:,.0f} грн</p>
-                </div>
-                <div class="bg-slate-900 border border-slate-800 p-5 rounded-2xl shadow-lg">
-                    <p class="text-slate-400 text-sm">Расходы</p>
-                    <p class="text-3xl font-bold text-rose-400 mt-1">-{sum_exp:,.0f} грн</p>
-                </div>
-            </div>
-
-            <div class="bg-slate-900 border border-slate-800 p-6 rounded-2xl shadow-lg mb-6">
-                <h2 class="text-xl font-semibold mb-4 text-slate-200">📌 Долги</h2>
-                <div class="space-y-2">
-    """
-    if debts:
-        for d in debts:
-            color = "text-emerald-400" if d.amount > 0 else "text-rose-400"
-            status = "должен тебе" if d.amount > 0 else "ты должен"
-            html += f"""
-                <div class="flex justify-between items-center bg-slate-800/50 p-3 rounded-xl border border-slate-700/50">
-                    <div>
-                        <span class="font-medium">{d.person}</span>
-                        <span class="text-xs text-slate-400 block">{d.description or ''}</span>
-                    </div>
-                    <span class="{color} font-semibold">{abs(d.amount)} грн ({status})</span>
-                </div>
-            """
-    else:
-        html += '<p class="text-slate-400 text-sm">Долгов пока нет.</p>'
-
     html += """
-                </div>
+                </table>
             </div>
-            
-            <div class="bg-slate-900 border border-slate-800 p-6 rounded-2xl shadow-lg">
-                <h2 class="text-xl font-semibold mb-4 text-slate-200">📜 Последние транзакции</h2>
-                <div class="space-y-2">
-    """
-    if recent_txs:
-        for t in recent_txs:
-            color = "text-emerald-400" if t.type == 'income' else "text-rose-400"
-            sign = "+" if t.type == 'income' else "-"
-            html += f"""
-                <div class="flex justify-between items-center bg-slate-800/50 p-3 rounded-xl border border-slate-700/50">
-                    <span class="font-medium">{t.comment}</span>
-                    <span class="{color} font-semibold">{sign}{t.amount} грн</span>
-                </div>
-            """
-    else:
-        html += '<p class="text-slate-400 text-sm">Транзакций пока нет.</p>'
-
-    html += """
-                </div>
-            </div>
-        </div>
-    </body>
+        </body>
     </html>
     """
     return html
 
-# --- ЗАПУСК ДЛЯ ОБЛАКА ---
+# --- ЗАПУСК ДЛЯ ОБЛАКА (БОТ + ВЕБ В ОДНОМ ПОТОКЕ) ---
 async def run_bot():
     init_db()
     await dp.start_polling(bot)
@@ -188,9 +175,10 @@ def run_web():
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    # Запускаем FastAPI в отдельном потоке, чтобы хостинг видел веб-сервер
+    # Запускаем FastAPI в отдельном потоке
     web_thread = threading.Thread(target=run_web, daemon=True)
     web_thread.start()
     
     # Запускаем бота
-    asyncio.run(run_bot())
+    asyncio_run = __import__("asyncio")
+    asyncio_run.run(run_bot())
