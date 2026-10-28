@@ -11,28 +11,25 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
 
 # --- НАСТРОЙКИ БАЗЫ ДАННЫХ И БОТА ---
-# Токен бота и ссылка на БД берутся из переменных окружения на Render
 TOKEN = os.environ.get("BOT_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# Инициализация бота и маршрутизатора
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 router = Router()
 
-# Настройка SQLAlchemy для Supabase (пул соединений)
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# Модель транзакции в базе данных
+# Модель транзакции под существующую структуру Supabase
 class Transaction(Base):
     __tablename__ = "transactions"
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, index=True)
-    type = Column(String)  # 'income', 'expense', 'debt'
     amount = Column(Float)
-    description = Column(String)
+    type = Column(String)  # 'income' или 'expense'
+    category_id = Column(Integer, nullable=True)
+    comment = Column(String, nullable=True)
     date = Column(DateTime, default=datetime.utcnow)
 
 def init_db():
@@ -40,7 +37,6 @@ def init_db():
 
 # --- ИНТЕРАКТИВНЫЕ КНОПКИ ---
 def get_main_keyboard():
-    # Твоя постоянная ссылка на дашборд в Render
     dashboard_url = "https://finance-bot-qshy.onrender.com"
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -64,7 +60,6 @@ async def cmd_start(message: Message):
         reply_markup=get_main_keyboard()
     )
 
-# Обработчики нажатий на кнопки меню
 @router.callback_query(F.data == "add_income")
 async def cb_add_income(callback: CallbackQuery):
     await callback.message.answer(
@@ -88,35 +83,34 @@ async def cb_manage_debts(callback: CallbackQuery):
     await callback.message.answer(
         "👥 **Учет долгов**\n"
         "Напиши запись в формате:\n"
-        "• `долг мне Имя Сумма` (например: *долг мне Саша 500*)\n"
-        "• `я должен Имя Сумма` (например: *я должен Макс 200*)"
+        "• `долг мне Имя Сумма`\n"
+        "• `я должен Имя Сумма`"
     )
     await callback.answer()
 
-# --- ОБРАБОТКА ТЕКСТОВЫХ ЗАПИСЕЙ (ДОХОДЫ / РАСХОДЫ) ---
+# --- ОБРАБОТКА ТЕКСТОВЫХ ЗАПИСЕЙ ---
 @router.message(F.text.regexp(r"^([+-]?\d+(?:\.\d+)?)\s+(.+)"))
 async def process_transaction(message: Message):
     text = message.text.strip()
     try:
         parts = text.split(maxsplit=1)
         amount = float(parts[0])
-        description = parts[1]
+        comment = parts[1]
         
         t_type = "income" if amount > 0 else "expense"
         
         db = SessionLocal()
         new_tx = Transaction(
-            user_id=message.from_user.id,
-            type=t_type,
             amount=amount,
-            description=description
+            type=t_type,
+            comment=comment
         )
         db.add(new_tx)
         db.commit()
         db.close()
         
         sign = "+" if amount > 0 else ""
-        await message.answer(f"✅ Успешно записано: <b>{sign}{amount}</b> ({description})")
+        await message.answer(f"✅ Успешно записано: <b>{sign}{amount}</b> ({comment})")
     except Exception as e:
         await message.answer("⚠️ Ошибка при сохранении. Проверь формат записи.")
 
@@ -148,13 +142,14 @@ def read_root():
         <body>
             <div class="container">
                 <h2>📊 Финансовый дашборд</h2>
-                <p>Последние транзакции из твоего бота:</p>
+                <p>Последние транзакции:</p>
                 <table>
-                    <tr><th>Дата</th><th>Тип</th><th>Сумма</th><th>Описание</th></tr>
+                    <tr><th>Дата</th><th>Тип</th><th>Сумма</th><th>Комментарий</th></tr>
     """
     for tx in transactions:
         color = "green" if tx.amount > 0 else "red"
-        html += f"<tr><td>{tx.date.strftime('%Y-%m-%d %H:%M')}</td><td>{tx.type}</td><td style='color:{color};'>{tx.amount}</td><td>{tx.description}</td></tr>"
+        date_str = tx.date.strftime('%Y-%m-%d %H:%M') if tx.date else ""
+        html += f"<tr><td>{date_str}</td><td>{tx.type}</td><td style='color:{color};'>{tx.amount}</td><td>{tx.comment}</td></tr>"
     
     html += """
                 </table>
@@ -164,7 +159,6 @@ def read_root():
     """
     return html
 
-# --- ЗАПУСК ДЛЯ ОБЛАКА (БОТ + ВЕБ В ОДНОМ ПОТОКЕ) ---
 async def run_bot():
     init_db()
     await dp.start_polling(bot)
@@ -175,10 +169,10 @@ def run_web():
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    # Запускаем FastAPI в отдельном потоке
+    init_db()
+    
     web_thread = threading.Thread(target=run_web, daemon=True)
     web_thread.start()
     
-    # Запускаем бота
     asyncio_run = __import__("asyncio")
     asyncio_run.run(run_bot())
