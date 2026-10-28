@@ -170,5 +170,159 @@ async def cb_show_debts(callback: CallbackQuery):
     else:
         text += "Список пуст 🎉\n"
         
-    add_btn_text = "➕ Добавить (кто должен)" if debt_type == "to_me" else "➕ Добавить (кому должен)"
-    add_cb = "add_debt_to_me" if debt_type == "to_me" else "
+    if debt_type == "to_me":
+        add_btn_text = "➕ Добавить (кто должен)"
+        add_cb = "add_debt_to_me"
+    else:
+        add_btn_text = "➕ Добавить (кому должен)"
+        add_cb = "add_debt_i_owe"
+    
+    keyboard_buttons.append([InlineKeyboardButton(text=add_btn_text, callback_data=add_cb)])
+    keyboard_buttons.append([InlineKeyboardButton(text="🔙 Назад в меню", callback_data="back_to_menu")])
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons))
+    await callback.answer()
+
+@router.callback_query(F.data.in_(["add_debt_to_me", "add_debt_i_owe"]))
+async def cb_add_debt_start(callback: CallbackQuery, state: FSMContext):
+    dt = "to_me" if callback.data == "add_debt_to_me" else "i_owe"
+    await state.update_data(debt_type=dt)
+    await callback.message.answer("✍️ Напиши в формате: `Имя Сумма` (например: `Андрей 500`):")
+    await state.set_state(FinanceStates.waiting_for_debt_amount)
+    await callback.answer()
+
+@router.message(FinanceStates.waiting_for_debt_amount)
+async def process_debt_save(message: Message, state: FSMContext):
+    try:
+        parts = message.text.strip().split(maxsplit=1)
+        person = parts[0]
+        amount = float(parts[1])
+        
+        data = await state.get_data()
+        db = SessionLocal()
+        new_debt = Debt(person=person, amount=amount, debt_type=data["debt_type"], status="active")
+        db.add(new_debt)
+        db.commit()
+        db.close()
+        
+        await state.clear()
+        await message.answer("✅ Долг успешно сохранен!", reply_markup=get_main_keyboard())
+    except Exception:
+        await message.answer("⚠️ Ошибка формата. Напиши так: `Имя Сумма` (например: `Максим 1000`)")
+
+@router.callback_query(F.data.startswith("pay_debt_"))
+async def cb_close_debt(callback: CallbackQuery):
+    debt_id = int(callback.data.split("_")[2])
+    db = SessionLocal()
+    debt = db.query(Debt).filter(Debt.id == debt_id).first()
+    if debt:
+        debt.status = "closed"
+        db.commit()
+    db.close()
+    
+    await callback.message.answer("✅ Долг отмечен как возвращенный!")
+    await callback.answer()
+
+@router.callback_query(F.data == "back_to_menu")
+async def cb_back(callback: CallbackQuery):
+    await callback.message.edit_text("🏠 Главное меню:", reply_markup=get_main_keyboard())
+    await callback.answer()
+
+def save_transaction(amount, t_type, account, comment):
+    db = SessionLocal()
+    tx = Transaction(amount=amount, type=t_type, account=account, comment=comment)
+    db.add(tx)
+    db.commit()
+    db.close()
+
+dp.include_router(router)
+
+# --- FASTAPI ВЕБ-ДАШБОРД ---
+app = FastAPI()
+
+@app.get("/", response_class=HTMLResponse)
+def read_root():
+    db = SessionLocal()
+    transactions = db.query(Transaction).order_by(Transaction.date.desc()).limit(20).all()
+    debts = db.query(Debt).filter(Debt.status == "active").all()
+    
+    cash_balance = sum(t.amount for t in db.query(Transaction).filter(Transaction.account == 'cash').all())
+    card_balance = sum(t.amount for t in db.query(Transaction).filter(Transaction.account == 'card').all())
+    db.close()
+    
+    rows = ""
+    for tx in transactions:
+        color = "green" if tx.amount > 0 else "red"
+        date_str = tx.date.strftime('%Y-%m-%d %H:%M') if tx.date else ""
+        rows += f"<tr><td>{date_str}</td><td>{tx.type}</td><td>{tx.account}</td><td style='color:{color};'>{tx.amount}</td><td>{tx.comment or ''}</td></tr>"
+
+    debt_rows = ""
+    for d in debts:
+        dt_name = "Мне должны" if d.debt_type == "to_me" else "Я должен"
+        debt_rows += f"<tr><td><b>{d.person}</b></td><td>{dt_name}</td><td>{d.amount}</td></tr>"
+
+    return f"""
+    <html>
+        <head>
+            <title>Finance Dashboard</title>
+            <meta charset="utf-8">
+            <style>
+                body {{ font-family: Arial, sans-serif; background: #f4f7f6; margin: 0; padding: 20px; }}
+                .container {{ max-width: 900px; margin: auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }}
+                .balance-box {{ display: flex; gap: 20px; margin-bottom: 20px; }}
+                .card {{ background: #4CAF50; color: white; padding: 15px; border-radius: 8px; flex: 1; text-align: center; }}
+                .card.cash {{ background: #2196F3; }}
+                h2, h3 {{ color: #333; }}
+                table {{ width: 100%; border-collapse: collapse; margin-top: 10px; margin-bottom: 30px; }}
+                th, td {{ padding: 10px; border-bottom: 1px solid #ddd; text-align: left; }}
+                th {{ background-color: #333; color: white; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h2>📊 Финансовый дашборд</h2>
+                
+                <div class="balance-box">
+                    <div class="card">
+                        <h3>💳 Баланс карты</h3>
+                        <p style="font-size: 24px; margin: 0;">{card_balance}</p>
+                    </div>
+                    <div class="card cash">
+                        <h3>💵 Наличные</h3>
+                        <p style="font-size: 24px; margin: 0;">{cash_balance}</p>
+                    </div>
+                </div>
+
+                <h3>Активные долги</h3>
+                <table>
+                    <tr><th>Кто / Кому</th><th>Тип</th><th>Сумма</th></tr>
+                    {debt_rows if debt_rows else "<tr><td colspan='3'>Нет активных долгов</td></tr>"}
+                </table>
+
+                <h3>Последние транзакции</h3>
+                <table>
+                    <tr><th>Дата</th><th>Тип</th><th>Счет</th><th>Сумма</th><th>Комментарий</th></tr>
+                    {rows}
+                </table>
+            </div>
+        </body>
+    </html>
+    """
+
+async def run_bot():
+    init_db()
+    await dp.start_polling(bot)
+
+def run_web():
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    init_db()
+    
+    web_thread = threading.Thread(target=run_web, daemon=True)
+    web_thread.start()
+    
+    asyncio_run = __import__("asyncio")
+    asyncio_run.run(run_bot())
